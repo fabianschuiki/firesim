@@ -80,14 +80,13 @@ class HostPortIO[+T <: Data](private val targetPortProto: T) extends Record with
       tokenChannel.bits := field
       fromHostChannels += tokenChannel
     }
-
     for ((field, localName) <- inputRVChannels) {
       val (fwdChPort, revChPort) = targetIO.rvOutputPortMap(local2globalName(localName + "_fwd"))
       field.valid := fwdChPort.bits.valid
       revChPort.bits := field.ready
 
       import chisel3.ExplicitCompileOptions.NotStrict
-      field.bits  := fwdChPort.bits.bits
+      field.bits := fwdChPort.bits.bits
 
       fromHostChannels += revChPort
       toHostChannels += fwdChPort
@@ -100,6 +99,7 @@ class HostPortIO[+T <: Data](private val targetPortProto: T) extends Record with
 
       import chisel3.ExplicitCompileOptions.NotStrict
       fwdChPort.bits.bits := field.bits
+
       fromHostChannels += fwdChPort
       toHostChannels += revChPort
     }

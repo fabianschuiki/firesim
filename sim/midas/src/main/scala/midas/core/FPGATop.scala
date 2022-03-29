@@ -32,7 +32,7 @@ case object CPUManagedAXI4Key extends Field[Option[CPUManagedAXI4Params]]
 
 /** FPGA-managed AXI4, aka "pcim" on F1. Used by the fabric to do DMA into
   * the host-CPU's memory. Used to implement bridge streams on platforms that lack a CPU-managed AXI4 interface.
-  * Set this to None if this interface is not present on the host. 
+  * Set this to None if this interface is not present on the host.
   */
 case object FPGAManagedAXI4Key extends Field[Option[FPGAManagedAXI4Params]]
 
@@ -341,7 +341,7 @@ class FPGATopImp(outer: FPGATop)(implicit p: Parameters) extends LazyModuleImp(o
   val ctrl = IO(Flipped(WidgetMMIO()))
   val mem = IO(Vec(p(HostMemNumChannels), AXI4Bundle(p(HostMemChannelKey).axi4BundleParams)))
 
-  val cpu_managed_axi4 = outer.cpuManagedAXI4NodeTuple.map { case (node, params) => 
+  val cpu_managed_axi4 = outer.cpuManagedAXI4NodeTuple.map { case (node, params) =>
     val port = IO(Flipped(AXI4Bundle(params.axi4BundleParams)))
     node.out.head._1 <> port
     port
@@ -366,20 +366,39 @@ class FPGATopImp(outer: FPGATop)(implicit p: Parameters) extends LazyModuleImp(o
     io <> bundle
   }
 
-  val sim = Module(new SimWrapper(p(SimWrapperKey)))
-  val simIo = sim.channelPorts
+  p(SimWrapperKey) match {
+    case config : SimWrapperConfigLite => {
+      val target = Module(new LiteTargetBox(config.inputs, config.outputs, config.readyValidPorts, config.name))
+      target.io.hostReset := reset.asBool
+      target.io.hostClock := clock
 
-  // Instantiate bridge widgets.
-  outer.bridgeModuleMap.map({ case (bridgeAnno, bridgeMod) =>
-    val widgetChannelPrefix = s"${bridgeAnno.target.ref}"
-    bridgeMod match {
-      case peekPoke: PeekPokeBridgeModule =>
-        peekPoke.module.io.step <> master.module.io.step
-        master.module.io.done := peekPoke.module.io.idle
-      case _ =>
+      // Instantiate bridge widgets.
+      outer.bridgeModuleMap.map({ case (bridgeAnno, bridgeMod) =>
+        bridgeMod match {
+          case peekPoke: PeekPokeBridgeModule =>
+            peekPoke.module.io.step <> master.module.io.step
+            master.module.io.done := peekPoke.module.io.idle
+          case _ =>
+        }
+        bridgeMod.module.hPort.connectChannels2Port(bridgeAnno, target.io)
+      })
     }
-    bridgeMod.module.hPort.connectChannels2Port(bridgeAnno, simIo)
-  })
+    case config: SimWrapperConfigFull => {
+      val sim = Module(new SimWrapper(config))
+      val simIo = sim.channelPorts
+
+      // Instantiate bridge widgets.
+      outer.bridgeModuleMap.map({ case (bridgeAnno, bridgeMod) =>
+        bridgeMod match {
+          case peekPoke: PeekPokeBridgeModule =>
+            peekPoke.module.io.step <> master.module.io.step
+            master.module.io.done := peekPoke.module.io.idle
+          case _ =>
+        }
+        bridgeMod.module.hPort.connectChannels2Port(bridgeAnno, simIo)
+      })
+    }
+  }
 
   outer.printStreamSummary(outer.toCPUStreamParams,   "Bridge Streams To CPU:")
   outer.printStreamSummary(outer.fromCPUStreamParams, "Bridge Streams From CPU:")

@@ -110,9 +110,15 @@ trait ChannelizedHostPortIO extends HasChannels { this: Record =>
     for ((_, channel, metadata) <- channels) {
       val localName = reverseElementMap(channel)
       if (metadata.bridgeSunk) {
-        channel <> targetIO.wireOutputPortMap(local2globalName(localName))
+        val port = targetIO.wireOutputPortMap(local2globalName(localName))
+        channel.bits := port.bits.asTypeOf(channel.bits)
+        channel.valid := port.valid
+        port.ready := channel.ready
       } else {
-        targetIO.wireInputPortMap(local2globalName(localName)) <> channel
+        val port = targetIO.wireInputPortMap(local2globalName(localName))
+        port.bits := channel.bits.asTypeOf(port.bits)
+        port.valid := channel.valid
+        channel.ready := port.ready
       }
     }
   }

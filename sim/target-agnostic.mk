@@ -10,6 +10,8 @@
 # - compiling meta-simulators (phony: verilator, vcs, verilator-debug, vcs-debug)
 #
 
+useCIRCT ?= 1
+
 # The prefix used for all Golden Gate-generated files
 BASE_FILE_NAME ?=
 
@@ -69,6 +71,19 @@ firesim_root_sbt_project := {file:$(firesim_base_dir)}firesim
 # extracted used to generate new runtime configurations.
 fame_annos := $(GENERATED_DIR)/post-bridge-extraction.json
 
+####################################
+# Rhodium Invocation
+####################################
+
+CLASSPATH_FILE=$(firesim_base_dir)/.classpath
+
+$(CLASSPATH_FILE) :
+	@echo "Generating $(CLASSPATH_FILE)"
+	java -Xmx16G -Dsbt.supershell=false -jar \
+		$(firesim_base_dir)/../target-design/chipyard/generators/rocket-chip/sbt-launch.jar \
+		--error \
+		"export runtime:fullClasspath" > $@
+
 .PHONY: verilog compile
 verilog: $(simulator_verilog)
 compile: $(simulator_verilog)
@@ -81,6 +96,7 @@ $(simulator_verilog) $(header) $(fame_annos): $(simulator_verilog).intermediate 
 # Disable FIRRTL 1.4 deduplication because it creates multiple failures
 # Run the 1.3 version instead (checked-in). If dedup must be completely disabled,
 # pass --no-legacy-dedup as well
+ifneq "$(useCIRCT)" "1"
 $(simulator_verilog).intermediate: $(FIRRTL_FILE) $(ANNO_FILE) $(SCALA_BUILDTOOL_DEPS)
 	$(call run_scala_main,$(firesim_sbt_project),midas.stage.GoldenGateMain,\
 		-i $(FIRRTL_FILE) \
@@ -93,6 +109,100 @@ $(simulator_verilog).intermediate: $(FIRRTL_FILE) $(ANNO_FILE) $(SCALA_BUILDTOOL
 	)
 	grep -sh ^ $(GENERATED_DIR)/firrtl_black_box_resource_files.f | \
 	xargs cat >> $(simulator_verilog) # Append blackboxes to FPGA wrapper, if any
+else
+$(simulator_verilog).intermediate: $(FIRRTL_FILE) $(ANNO_FILE) $(SCALA_BUILDTOOL_DEPS) $(CLASSPATH_FILE)
+	@echo "Using rhodium to transform target"
+	mkdir -p $(GENERATED_DIR)/goldengate $(GENERATED_DIR)/rhodium
+
+	# Run Golden Gate for all the files which Rhodium doesn't generate yet.
+	$(call run_scala_main,$(firesim_sbt_project),midas.stage.ExtractConfig,\
+		$(PLATFORM_CONFIG_PACKAGE) \
+		$(PLATFORM_CONFIG) \
+		$(GENERATED_DIR)/config \
+	)
+
+	firtool $(FIRRTL_FILE) --annotation-file $(ANNO_FILE) \
+			-o $(GENERATED_DIR)/rhodium/in.mlir \
+			--parse-only \
+			--disable-annotation-unknown=true
+
+	# Main rhodium run: generate MLIR.
+	rhodium $(GENERATED_DIR)/rhodium/in.mlir \
+		-o $(GENERATED_DIR)/rhodium/target.mlir \
+		--mlir-disable-threading \
+		--export-shim-config=$(GENERATED_DIR)/rhodium/shim.json \
+		--verbose-pass-executions \
+		$$(cat $(GENERATED_DIR)/config) \
+		2>&1
+
+	# Run the platform shim elaboration step.
+	java -classpath $$(cat $(CLASSPATH_FILE) | head -n 1) \
+		midas.stage.PlatformShimElabMain \
+		-ep    $(GENERATED_DIR)/rhodium/shim.json \
+		-o     $(GENERATED_DIR)/rhodium/shim.fir \
+		-td    $(GENERATED_DIR)/rhodium \
+		-ofb   $(BASE_FILE_NAME) \
+		-ggcp  $(PLATFORM_CONFIG_PACKAGE) \
+		-ggcs  $(PLATFORM_CONFIG) \
+		2>&1
+
+	# Compile all files emitted by the shim generator to MLIR.
+	find '$(GENERATED_DIR)/rhodium/' -name '*.fir' -exec \
+		sh -c '\
+		firtool {} --annotation-file {}.anno.json -o - \
+			--ir-hw --disable-annotation-unknown=true |\
+		firesim-opt - -o {}.mlir --firesim-materialize-intrinsics' \
+		\;
+
+	# Link the shim with the target.
+	rhodium-link -o $(GENERATED_DIR)/rhodium/out.mlir \
+		$$(find '$(GENERATED_DIR)/rhodium/' -name '*.fir.mlir') \
+		$(GENERATED_DIR)/rhodium/target.mlir \
+		--clock-gate-module=BUFGCE
+
+	# Turn the output of rhodium into SV.
+	firtool $(GENERATED_DIR)/rhodium/out.mlir \
+		-o $(GENERATED_DIR)/rhodium/verilog \
+		--split-verilog \
+		--strip-debug-info \
+		--lowering-options=explicitBitcast
+	find $(GENERATED_DIR)/rhodium/verilog -name '*.sv' -or -name '*.v' | \
+		xargs cat > $(GENERATED_DIR)/rhodium/$(BASE_FILE_NAME).sv
+
+	echo > $(GENERATED_DIR)/FireSim-generated.synthesis.xdc
+	echo > $(GENERATED_DIR)/FireSim-generated.implementation.xdc
+	for xdc_file in $$(ls $(GENERATED_DIR)/rhodium/verilog/*.xdc); do \
+		cp $$xdc_file $(GENERATED_DIR)/; \
+	done
+
+	# Delete the emitted verilog files, keeping only the monolithic source.
+	rm -rf $(GENERATED_DIR)/rhodium/verilog
+
+	# Plug in the verilog & headers.
+	find $(GENERATED_DIR)/rhodium \
+		-maxdepth 1 \
+		-name '*.sv' -or \
+		-name '*.v' -or \
+		-name '*.vh' -or \
+		-name '*.h' -or \
+		-name '*.conf' -or \
+		-name '*.xdc' -or \
+		-name '*.tcl' | \
+		xargs -r -I{} cp {} $(GENERATED_DIR)/
+	cp $(GENERATED_DIR)/rhodium/$(BASE_FILE_NAME).sv $(simulator_verilog)
+ifeq "$(enableSFC)" "1"
+		# Run Golden Gate for all the files which Rhodium doesn't generate yet.
+		$(call run_scala_main,$(firesim_sbt_project),midas.stage.GoldenGateMain,\
+			-i $(FIRRTL_FILE) \
+			-td $(GENERATED_DIR)/goldengate \
+			-faf $(ANNO_FILE) \
+			-ggcp $(PLATFORM_CONFIG_PACKAGE) \
+			-ggcs $(PLATFORM_CONFIG) \
+			--output-filename-base $(BASE_FILE_NAME) \
+			--no-dedup \
+		)
+endif
+endif
 
 ####################################
 # Runtime-Configuration Generation #

@@ -61,6 +61,8 @@ DRIVER_CC = $(wildcard $(addprefix $(driver_dir)/, $(addsuffix .cc, fasedtests/*
 TARGET_CXX_FLAGS := -g -O2 -I$(driver_dir) -I$(driver_dir)/fasedtests -I$(RISCV)/include
 TARGET_LD_FLAGS :=
 
+EXTRA_VERILATOR_FLAGS = -Wno-WIDTH -Wno-CMPCONST -Wno-UNSIGNED
+
 ################################################################
 # SW RTL Simulation Args -- for MIDAS- & FPGA-level Simulation #
 ################################################################

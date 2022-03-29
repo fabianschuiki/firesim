@@ -69,6 +69,8 @@ DRIVER_CC := \
 TARGET_CXX_FLAGS := -DDESIGNDRIVERCLASS=$(DESIGN)_t -DDESIGNNAME_$(DESIGN) -I$(driver_dir) -I$(RISCV)/include -I$(driver_dir)/midasexamples -g
 TARGET_LD_FLAGS :=
 
+EXTRA_VERILATOR_FLAGS = -Wno-UNSIGNED
+
 ##########################
 # Midas-Level Sim Recipes#
 ##########################

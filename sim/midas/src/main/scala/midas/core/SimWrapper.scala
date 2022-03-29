@@ -18,7 +18,7 @@ import chisel3.experimental.{Direction, ChiselAnnotation, annotate}
 import chisel3.experimental.DataMirror.directionOf
 import firrtl.annotations.{Annotation, SingleTargetAnnotation, ReferenceTarget, IsModule}
 
-import scala.collection.immutable.ListMap
+import scala.collection.immutable.{ListMap, SeqMap}
 import scala.collection.mutable
 
 case object SimWrapperKey extends Field[SimWrapperConfig]
@@ -37,6 +37,20 @@ class SimReadyValidRecord(es: Seq[(String, ReadyValidIO[Data])]) extends Record 
   def cloneType = new SimReadyValidRecord(es).asInstanceOf[this.type]
 }
 
+case class ReadyValidPort(ready: String, data: String, kind: String)
+
+sealed trait TargetPort
+case class PrimitivePort(tpe: firrtl.ir.Type) extends TargetPort
+case class ClockChannelPort(numClocks: Int) extends TargetPort
+case class ChannelPort(tpe: firrtl.ir.Type) extends TargetPort
+
+/**
+ * Base for metadata objects describing simulation wrappers.
+ */
+sealed trait SimWrapperConfig {
+  def annotations: Seq[Annotation]
+}
+
 /**
   * The metadata required to generate the simulation wrapper.
   *
@@ -47,13 +61,27 @@ class SimReadyValidRecord(es: Seq[(String, ReadyValidIO[Data])]) extends Record 
   * "link" against the transformed RTL (FIRRTL), and associate specific
   * annotations with those types..
   */
-case class SimWrapperConfig(annotations: Seq[Annotation], leafTypeMap: Map[ReferenceTarget, firrtl.ir.Port])
+case class SimWrapperConfigFull(
+    annotations: Seq[Annotation],
+    leafTypeMap: Map[ReferenceTarget, firrtl.ir.Port]
+) extends SimWrapperConfig
+
+/**
+ * Metadata for simulation wrapper generation without channel instances.
+ */
+case class SimWrapperConfigLite(
+    annotations: Seq[Annotation],
+    inputs: SeqMap[String, TargetPort],
+    outputs: SeqMap[String, TargetPort],
+    readyValidPorts: Seq[ReadyValidPort],
+    name: String
+) extends SimWrapperConfig
 
 /**
   * A convienence mixin that preprocesses the [[SimWrapperConfig]]
   */
 trait UnpackedWrapperConfig {
-  def config: SimWrapperConfig
+  def config: SimWrapperConfigFull
   val leafTypeMap = config.leafTypeMap
   val chAnnos     = new mutable.ArrayBuffer[FAMEChannelConnectionAnnotation]()
   val bridgeAnnos = new mutable.ArrayBuffer[BridgeIOAnnotation]()
@@ -64,7 +92,6 @@ trait UnpackedWrapperConfig {
     case ffa: FAMEChannelFanoutAnnotation => fanoutAnnos += ffa
   }
 }
-
 
 /**
  *  Represents the interface of the target to which bridges connect.
@@ -97,7 +124,7 @@ trait TargetChannelIO {
   * name.
   */
 
-abstract class ChannelizedWrapperIO(val config: SimWrapperConfig)
+abstract class ChannelizedWrapperIO(val config: SimWrapperConfigFull)
     extends Record with UnpackedWrapperConfig with TargetChannelIO {
 
   val payloadTypeMap: Map[FAMEChannelConnectionAnnotation, Data] = chAnnos.collect({
@@ -206,7 +233,7 @@ class ClockRecord(numClocks: Int) extends Record {
   override def cloneType = new ClockRecord(numClocks).asInstanceOf[this.type]
 }
 
-class TargetBoxIO(config: SimWrapperConfig) extends ChannelizedWrapperIO(config) {
+class TargetBoxIO(config: SimWrapperConfigFull) extends ChannelizedWrapperIO(config) {
 
   def regenClockType(refTargets: Seq[ReferenceTarget]): Data = refTargets.size match {
     case 1 => Clock()
@@ -226,11 +253,11 @@ class TargetBoxIO(config: SimWrapperConfig) extends ChannelizedWrapperIO(config)
   override def cloneType: this.type = new TargetBoxIO(config).asInstanceOf[this.type]
 }
 
-class TargetBox(config: SimWrapperConfig) extends BlackBox {
+class TargetBox(config: SimWrapperConfigFull) extends BlackBox {
   val io = IO(new TargetBoxIO(config))
 }
 
-class SimWrapperChannels(config: SimWrapperConfig) extends ChannelizedWrapperIO(config) {
+class SimWrapperChannels(config: SimWrapperConfigFull) extends ChannelizedWrapperIO(config) {
 
   def regenClockType(refTargets: Seq[ReferenceTarget]): Vec[Bool] = Vec(refTargets.size, Bool())
 
@@ -250,7 +277,7 @@ class SimWrapperChannels(config: SimWrapperConfig) extends ChannelizedWrapperIO(
   * 2) Generates channels to interconnect those models and bridges by analyzing [[FAMEChannelConnectionAnnotation]]s.
   * 3) Exposes ReadyValid interfaces for all channels sourced or sunk by a bridge as I/O
   */
-class SimWrapper(val config: SimWrapperConfig)(implicit val p: Parameters) extends Module with UnpackedWrapperConfig {
+class SimWrapper(val config: SimWrapperConfigFull)(implicit val p: Parameters) extends Module with UnpackedWrapperConfig {
   outer =>
   // Filter FCCAs presented to the top-level IO constructor. Remove all FCCAs:
   // - That are loopback channels (these don't connect to bridges).
@@ -413,3 +440,112 @@ class SimWrapper(val config: SimWrapperConfig)(implicit val p: Parameters) exten
   require(clockChannels.size == 1)
   genClockChannel(clockChannels.head)
 }
+
+class LiteTargetBoxIO(
+    inputs: SeqMap[String, TargetPort],
+    outputs: SeqMap[String, TargetPort],
+    readyValidPorts: Seq[ReadyValidPort]
+) extends Record with TargetChannelIO {
+
+  val hostClock = Input(Clock())
+  val hostReset = Input(Bool())
+
+  val readyIn: SeqMap[String, ReadyValidIO[Bool]] = ListMap(readyValidPorts.collect {
+    case ReadyValidPort(ready, _, "output") => {
+      println(s"Ready In: ${ready}")
+      ready -> Flipped(Decoupled(Bool()))
+    }
+  } : _*)
+
+  val readyOut: SeqMap[String, ReadyValidIO[Bool]] = ListMap(readyValidPorts.collect {
+    case ReadyValidPort(ready, _, "input") => {
+      println(s"Ready Out: ${ready}")
+      ready -> Decoupled(Bool())
+    }
+  } : _*)
+
+  val dataIn: SeqMap[String, ReadyValidIO[Valid[Data]]] = ListMap(readyValidPorts.collect {
+    case ReadyValidPort(_, data, "input") => {
+      val ChannelPort(tpe) = inputs(data)
+      val channelTy = typeToData(tpe)
+      println(s"Data In: ${data} ${channelTy}")
+      data -> Flipped(Decoupled(Valid(channelTy)))
+    }
+  } : _*)
+
+  val dataOut: SeqMap[String, ReadyValidIO[Valid[Data]]] = ListMap(readyValidPorts.collect {
+    case ReadyValidPort(_, data, "output") => {
+      val ChannelPort(tpe) = outputs(data)
+      val channelTy = typeToData(tpe)
+      println(s"Data Out: ${data} ${channelTy}")
+      data -> Decoupled(Valid(channelTy))
+    }
+  } : _*)
+
+  val wireInputPortMap: SeqMap[String, ReadyValidIO[Data]] = inputs.collect {
+    case (name, ChannelPort(tpe)) if !readyIn.contains(name) && !dataIn.contains(name) => {
+      val channelTy = typeToData(tpe)
+      println(s"Input port ${name}: ${channelTy}")
+      name -> Flipped(Decoupled(channelTy))
+    }
+  }
+
+  val wireOutputPortMap: SeqMap[String, ReadyValidIO[Data]] = outputs.collect {
+    case (name, ChannelPort(tpe)) if !readyOut.contains(name) && !dataOut.contains(name) => {
+      val channelTy = typeToData(tpe)
+      println(s"Output port ${name}: ${channelTy}")
+      name -> Decoupled(channelTy)
+    }
+  }
+
+  val rvInputPortMap: Map[String, TargetRVPortType] = ListMap(readyValidPorts.collect {
+    case ReadyValidPort(ready, data, "input") => {
+      println(s"Ready-Valid Input: ${data} => ${ready}")
+      data -> (dataIn(data), readyOut(ready))
+    }
+  } : _*)
+
+  val rvOutputPortMap: Map[String, TargetRVPortType] = ListMap(readyValidPorts.collect {
+    case ReadyValidPort(ready, data, "output") => {
+      println(s"Ready-Valid Output: ${data} => ${ready}")
+      data -> (dataOut(data), readyIn(ready))
+    }
+  } : _*)
+
+  val clockElement: (String, DecoupledIO[Data]) = inputs.collectFirst({
+    case (name, ClockChannelPort(n)) => name -> Flipped(Decoupled(Vec(n, Bool())))
+  }).get
+
+  override val elements: SeqMap[String, Data] = ListMap((
+      outputs.collect({
+        case (name, PrimitivePort(tpe)) => name -> Output(typeToData(tpe))
+        case (name, ChannelPort(_)) if readyOut.contains(name) => name -> readyOut(name)
+        case (name, ChannelPort(_)) if dataOut.contains(name) => name -> dataOut(name)
+        case (name, ChannelPort(_)) => name -> wireOutputPortMap(name)
+      }).toSeq.reverse ++
+      inputs.collect({
+        case (name, ClockChannelPort(_)) => clockElement
+        case (name, ChannelPort(_)) if readyIn.contains(name) => name -> readyIn(name)
+        case (name, ChannelPort(_)) if dataIn.contains(name) => name -> dataIn(name)
+        case (name, ChannelPort(_)) => name -> wireInputPortMap(name)
+      }).toSeq.reverse ++
+      List(
+        "hostReset" -> hostReset,
+        "hostClock" -> hostClock
+      )
+  ) : _*)
+
+  override def cloneType: this.type = new LiteTargetBoxIO(inputs, outputs, readyValidPorts).asInstanceOf[this.type]
+}
+
+class LiteTargetBox(
+    inputs: SeqMap[String, TargetPort],
+    outputs: SeqMap[String, TargetPort],
+    readyValidPorts: Seq[ReadyValidPort],
+    name: String
+) extends BlackBox {
+  override def desiredName = name
+
+  val io = IO(new LiteTargetBoxIO(inputs, outputs, readyValidPorts))
+}
+

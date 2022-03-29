@@ -103,6 +103,13 @@ object SimUtils {
     override def toString: String = s"{${elements.map({case (name, data) => s"${name}: ${data}"}).mkString(", ")}}"
   }
 
+  def typeToData(ty: firrtl.ir.Type): Data = ty match {
+    case firrtl.ir.UIntType(width: firrtl.ir.IntWidth) => UInt(width.width.toInt.W)
+    case firrtl.ir.SIntType(width: firrtl.ir.IntWidth) => SInt(width.width.toInt.W)
+    case firrtl.ir.BundleType(fields) => new BundleRecord(fields.map(f => f.name -> typeToData(f.tpe)))
+    case _ => throw new RuntimeException(s"Unexpected type in token payload: ${ty}.")
+  }
+
   /**
     * Construct a type for a channel carrying the wires referenced by the list of targets.
     *

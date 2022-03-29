@@ -25,3 +25,4 @@ lib/firrtl.jar
 .bloop/
 project/metals.sbt
 project/project
+.classpath
